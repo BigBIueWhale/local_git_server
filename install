@@ -1,0 +1,224 @@
+#!/bin/bash
+# install [--check] [--rebuild-image]
+#
+# Installs the local git server described in README.md, or brings an installation up to date.
+# Safe to run any number of times: it changes only what differs from this repository, and restarts
+# the server only if something it runs on (its unit, image or cleanup script) changed.
+#
+#   --check          change nothing; report how this machine differs from this repository
+#                    (exit 0: identical, 1: differences)
+#   --rebuild-image  rebuild the image without Docker's cache (fetches Alpine's current git package)
+#
+# Run as root: ./as-root ./install
+source "$(dirname "$0")/lib/common.sh"
+
+CHECK=0 REBUILD=0
+for a in "$@"; do
+  case "$a" in
+    --check) CHECK=1 ;;
+    --rebuild-image) REBUILD=1 ;;
+    *) die "unknown option: $a" ;;
+  esac
+done
+need_root "$@"
+load_config full
+
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+
+# destination | mode | how it's made from this repository
+FILES=(
+  "$OPT_DIR/Dockerfile|0644|copy|image/Dockerfile"
+  "$OPT_DIR/gitconfig|0644|copy|image/gitconfig"
+  "$OPT_DIR/gitstick-cleanup|0755|render|templates/gitstick-cleanup"
+  "$OPT_DIR/README.md|0644|copy|README.md"
+  "$OPT_DIR/config.env|0644|copy|$CONFIG_FILE"
+  "$UNIT_DIR/$MOUNT_UNIT|0644|render|templates/srv-gitstick.mount"
+  "$UNIT_DIR/$SERVICE_UNIT|0644|render|templates/gitstick.service"
+  "$UNIT_DIR/gitstick-cleanup.service|0644|copy|templates/gitstick-cleanup.service"
+  "$UNIT_DIR/gitstick-cleanup.timer|0644|copy|templates/gitstick-cleanup.timer"
+  "$UDEV_RULE|0644|render|templates/99-gitstick.rules"
+)
+
+# --- stage everything ------------------------------------------------------------------------
+i=0
+for entry in "${FILES[@]}"; do
+  IFS='|' read -r dest mode how src <<< "$entry"
+  case "$src" in /*) ;; *) src=$REPO_DIR/$src ;; esac
+  if [ "$how" = render ]; then render "$src" > "$STAGE/$i"; else cp "$src" "$STAGE/$i"; fi
+  i=$((i + 1))
+done
+mkdir "$STAGE/image"
+cp "$REPO_DIR/image/Dockerfile" "$REPO_DIR/image/gitconfig" "$STAGE/image/"
+CONTEXT_SHA=$(cd "$STAGE/image" && sha256sum Dockerfile gitconfig | sha256sum | cut -c1-64)
+LABEL=local-git-server.context-sha256
+
+image_label() { docker image inspect -f "{{index .Config.Labels \"$LABEL\"}}" "$IMAGE" 2>/dev/null || true; }
+image_id() { docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || true; }
+
+# The empty mount point underneath the stick must be immutable. Looks under the mount, if any,
+# through a non-recursive bind mount in a private mount namespace.
+underlying_attrs() {
+  unshare -m --propagation private sh -c '
+    m=$(mktemp -d); mount --bind "$(dirname "$1")" "$m" || exit 1
+    d="$m/$(basename "$1")"
+    if [ -d "$d" ]; then printf "%s|%s\n" "$(lsattr -d "$d" | cut -d" " -f1)" "$(ls -A "$d" | wc -l)"; else echo "missing|0"; fi
+    umount "$m"; rmdir "$m"' sh "$MOUNT_POINT"
+}
+
+# --- check mode --------------------------------------------------------------------------------
+if [ "$CHECK" = 1 ]; then
+  differ=0
+  i=0
+  for entry in "${FILES[@]}"; do
+    IFS='|' read -r dest mode how src <<< "$entry"
+    if [ ! -e "$dest" ]; then echo "missing:  $dest"; differ=1
+    elif ! cmp -s "$STAGE/$i" "$dest"; then echo "differs:  $dest"; diff -u "$dest" "$STAGE/$i" | sed 's/^/    /' || true; differ=1
+    elif [ "$(stat -c '%a %U %G' "$dest")" != "${mode#0} root root" ]; then echo "mode/owner: $dest is $(stat -c '%a %U %G' "$dest"), want ${mode#0} root root"; differ=1
+    else echo "same:     $dest"; fi
+    i=$((i + 1))
+  done
+  if [ -z "$(image_id)" ]; then echo "missing:  image $IMAGE"; differ=1
+  elif [ "$(image_label)" != "$CONTEXT_SHA" ]; then echo "differs:  image $IMAGE wasn't built from this repository's image/ (label '$(image_label)')"; differ=1
+  else echo "same:     image $IMAGE (built from image/)"; fi
+  running=$(docker inspect -f '{{.Image}}' gitstick 2>/dev/null || true)
+  if [ -n "$running" ] && [ "$running" != "$(image_id)" ]; then echo "differs:  the running server uses an older image"; differ=1; fi
+  attrs=$(underlying_attrs)
+  case "${attrs%|*}" in *i*) echo "same:     $MOUNT_POINT (underneath) is immutable and holds ${attrs#*|} entries" ;;
+    *) echo "differs:  $MOUNT_POINT (underneath): attributes '${attrs%|*}'"; differ=1 ;; esac
+  for u in "$MOUNT_UNIT" "$SERVICE_UNIT" gitstick-cleanup.timer; do
+    st=$(systemctl is-enabled "$u" 2>/dev/null || true)
+    if [ "$st" = enabled ]; then echo "same:     $u enabled"; else echo "differs:  $u is '$st'"; differ=1; fi
+  done
+  [ "$differ" = 0 ] && echo "RESULT: this machine matches the repository" || echo "RESULT: differences found (run ./as-root ./install to apply them)"
+  exit "$differ"
+fi
+
+# --- install -----------------------------------------------------------------------------------
+log "preflight"
+for c in docker systemctl systemd-escape findmnt setpriv chattr lsattr unshare udevadm ss blkid; do
+  command -v "$c" >/dev/null || die "missing command: $c"
+done
+systemctl is-active --quiet docker.service || die "docker.service isn't running"
+[ "$(systemd-escape --path --suffix=mount "$MOUNT_POINT")" = "$MOUNT_UNIT" ] || die "mount unit name mismatch"
+CHANGED=()
+
+log "image $IMAGE"
+old_id=$(image_id)
+# Each build gets a new image ID even when every layer is cached (BuildKit records the build time),
+# so the image is rebuilt only when image/ changed (its hash is the image's label) or when asked.
+if [ "$REBUILD" = 0 ] && [ -n "$old_id" ] && [ "$(image_label)" = "$CONTEXT_SHA" ]; then
+  echo "  up to date: built from this repository's image/"
+else
+  build_opts=(); [ "$REBUILD" = 1 ] && build_opts+=(--no-cache)
+  docker build -q "${build_opts[@]}" --label "$LABEL=$CONTEXT_SHA" -t "$IMAGE" "$STAGE/image" >/dev/null
+fi
+new_id=$(image_id)
+IMAGE_CHANGED=0
+if [ "$old_id" != "$new_id" ]; then IMAGE_CHANGED=1; CHANGED+=("image"); fi
+echo "  $new_id ($(docker run --rm --network none --entrypoint git "$IMAGE" --version))"
+
+log "files"
+UNITS_CHANGED=0 MOUNT_CHANGED=0 UDEV_CHANGED=0 SERVER_CHANGED=$IMAGE_CHANGED
+i=0
+for entry in "${FILES[@]}"; do
+  IFS='|' read -r dest mode how src <<< "$entry"
+  if [ -e "$dest" ] && cmp -s "$STAGE/$i" "$dest" && [ "$(stat -c '%a %U %G' "$dest")" = "${mode#0} root root" ]; then
+    echo "  same     $dest"
+  else
+    install -D -m "$mode" -o root -g root "$STAGE/$i" "$dest"
+    echo "  updated  $dest"; CHANGED+=("$dest")
+    case "$dest" in
+      "$UNIT_DIR"/*) UNITS_CHANGED=1 ;;
+    esac
+    case "$dest" in
+      "$UNIT_DIR/$MOUNT_UNIT") MOUNT_CHANGED=1 ;;
+      "$UNIT_DIR/$SERVICE_UNIT"|"$OPT_DIR/gitstick-cleanup") SERVER_CHANGED=1 ;;
+      "$UDEV_RULE") UDEV_CHANGED=1 ;;
+    esac
+  fi
+  i=$((i + 1))
+done
+
+log "mount point $MOUNT_POINT"
+if [ ! -e "$MOUNT_POINT" ]; then
+  install -d -m 0755 -o root -g root "$MOUNT_POINT"
+  chattr +i "$MOUNT_POINT"
+  echo "  created, immutable"; CHANGED+=("$MOUNT_POINT")
+else
+  attrs=$(underlying_attrs)
+  case "${attrs%|*}" in
+    *i*) echo "  immutable underneath (${attrs#*|} entries)" ;;
+    missing) die "can't inspect what's underneath $MOUNT_POINT" ;;
+    *)
+      [ "${attrs#*|}" = 0 ] || die "$MOUNT_POINT underneath the stick isn't empty: something wrote there while the stick was absent"
+      unshare -m --propagation private sh -c 'm=$(mktemp -d); mount --bind "$(dirname "$1")" "$m" && chattr +i "$m/$(basename "$1")"; umount "$m"; rmdir "$m"' sh "$MOUNT_POINT"
+      echo "  made immutable"; CHANGED+=("$MOUNT_POINT immutable") ;;
+  esac
+fi
+
+STICK_PRESENT=0
+[ -e "/dev/disk/by-uuid/$STICK_FS_UUID" ] && STICK_PRESENT=1
+
+log "udev"
+if [ "$UDEV_CHANGED" = 1 ]; then
+  udevadm control --reload
+  echo "  rules reloaded"
+fi
+if [ "$STICK_PRESENT" = 1 ]; then
+  disk=$(stick_disk) || die "the stick's file system is present but no USB disk has serial $STICK_SERIAL"
+  for dev in $(lsblk -nrpo NAME "$disk"); do udevadm trigger --action=change "$dev"; done
+  udevadm settle
+  udevadm info -q property -n "/dev/disk/by-uuid/$STICK_FS_UUID" | grep -q '^UDISKS_IGNORE=1$' \
+    || die "udev rule not applied to the stick (UDISKS_IGNORE)"
+  echo "  stick hidden from udisks/GNOME"
+fi
+
+log "systemd"
+if [ "$UNITS_CHANGED" = 1 ]; then systemctl daemon-reload; echo "  reloaded"; fi
+if [ "$MOUNT_CHANGED" = 1 ]; then systemctl reenable "$MOUNT_UNIT" 2>&1 | sed 's/^/  /'; else systemctl enable "$MOUNT_UNIT" 2>&1 | sed 's/^/  /'; fi
+systemctl enable "$SERVICE_UNIT" 2>&1 | sed 's/^/  /'
+systemctl enable --now gitstick-cleanup.timer 2>&1 | sed 's/^/  /'
+[ -L "$UNIT_DIR/$DEVICE_UNIT.wants/$MOUNT_UNIT" ] || die "$DEVICE_UNIT.wants/$MOUNT_UNIT missing"
+if [ "$STICK_PRESENT" = 1 ]; then
+  systemctl show -p Wants --value "$DEVICE_UNIT" | grep -qw "$MOUNT_UNIT" || die "$DEVICE_UNIT doesn't pull in $MOUNT_UNIT"
+fi
+echo "  $MOUNT_UNIT: wanted by the stick's device, enabled; $SERVICE_UNIT and gitstick-cleanup.timer enabled"
+
+if [ "$STICK_PRESENT" = 0 ]; then
+  log "the stick (UUID $STICK_FS_UUID) isn't plugged in: everything starts when it is"
+else
+  log "bring up"
+  if [ "$MOUNT_CHANGED" = 1 ] && systemctl is-active --quiet "$MOUNT_UNIT"; then
+    systemctl stop "$SERVICE_UNIT"; systemctl restart "$MOUNT_UNIT"; echo "  remounted with the new mount unit"
+  fi
+  systemctl start "$MOUNT_UNIT"
+  stick_mounted_rw || die "the stick isn't mounted read-write at $MOUNT_POINT"
+  if [ ! -d "$REPOS_DIR" ]; then
+    as_server_user mkdir -m 0700 "$REPOS_DIR"; echo "  created $REPOS_DIR"; CHANGED+=("$REPOS_DIR")
+  fi
+  if [ "$SERVER_CHANGED" = 1 ] || ! systemctl is-active --quiet "$SERVICE_UNIT"; then
+    systemctl restart "$SERVICE_UNIT"; echo "  server (re)started"
+  else
+    echo "  server already running on the current image and unit"
+  fi
+  for _ in $(seq 1 30); do ss -tlnH "sport = :${LISTEN##*:}" | grep -q . && break; sleep 1; done
+fi
+
+log "verify"
+if [ "$STICK_PRESENT" = 1 ]; then
+  listeners=$(ss -tlnH "sport = :${LISTEN##*:}" | awk '{print $4}' | sort -u | tr '\n' ' ')
+  [ "$listeners" = "$LISTEN " ] || die "expected exactly one listener on $LISTEN, found: [$listeners]"
+  opts=$(findmnt -rn -o OPTIONS --mountpoint "$MOUNT_POINT")
+  for o in rw nodev nosuid noexec noatime errors=remount-ro; do
+    [[ ",$opts," == *",$o,"* ]] || die "mount option $o missing ($opts)"
+  done
+  [ "$(docker inspect -f '{{.Image}}' gitstick)" = "$(image_id)" ] || die "the server isn't running the current image"
+  echo "  listening only on $LISTEN; mounted $opts; server on image ${new_id:7:12}"
+fi
+# A replaced image is removed by Docker itself once nothing uses it (containerd image store);
+# with the classic store it stays as a dangling image until removed here.
+if [ -n "$old_id" ] && [ "$old_id" != "$new_id" ] && docker image rm "$old_id" >/dev/null 2>&1; then
+  echo "  removed the previous image ${old_id:7:12}"
+fi
+if [ ${#CHANGED[@]} = 0 ]; then echo "RESULT: nothing to change"; else echo "RESULT: changed: ${CHANGED[*]}"; fi

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily removal of interrupted-push leftovers on the local git server
+Documentation=file:/opt/gitstick/README.md
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,47 @@
+#!/bin/bash
+# Removes what interrupted pushes leave in the bare repositories on the stick.
+# git's receive-pack keeps a push's incoming data in objects/tmp_objdir-incoming-* until the push
+# is complete, and leaves that folder behind when the client dies mid-push (seen 17/11/2026,
+# with git 2.54 in the image and git 2.43 on the host). No ref ever points into it.
+#
+#   start  run by gitstick.service before the server starts, when no push can be in progress:
+#          removes every quarantine folder, temporary pack file and stale ref lock.
+#   stale  run daily by gitstick-cleanup.timer while the server runs: removes quarantine
+#          folders that nothing has written to for 24 hours.
+#
+# Runs as uid 1000 (the owner of everything in the repositories), never as root.
+set -euo pipefail
+MODE=${1:-}
+case "$MODE" in start|stale) ;; *) echo "usage: $0 start|stale" >&2; exit 2;; esac
+[ "$(id -u)" = 1000 ] || { echo "run as uid 1000, not $(id -u)" >&2; exit 2; }
+
+BASE=/srv/gitstick/git
+if ! findmnt -rn --mountpoint /srv/gitstick --source UUID=@STICK_FS_UUID@ >/dev/null; then
+  echo "stick not mounted: nothing to clean"; exit 0
+fi
+
+shopt -s nullglob
+removed=0
+for repo in "$BASE"/*.git; do
+  [ -d "$repo/objects" ] && [ ! -L "$repo" ] || continue
+  for q in "$repo"/objects/tmp_objdir-incoming-*; do
+    [ -d "$q" ] && [ ! -L "$q" ] || continue
+    if [ "$MODE" = stale ] && [ -n "$(find "$q" -mmin -1440 -print -quit)" ]; then
+      echo "keeping (written to in the last 24 h): $q"; continue
+    fi
+    echo "removing $(du -sh "$q" | cut -f1) left by an interrupted push: $q"
+    rm -rf --one-file-system -- "$q"
+    removed=$((removed + 1))
+  done
+  if [ "$MODE" = start ]; then
+    while IFS= read -r -d '' f; do
+      echo "removing stale temporary file: $f"; rm -f -- "$f"; removed=$((removed + 1))
+    done < <(find "$repo/objects/pack" -maxdepth 1 -type f \( -name 'tmp_*' -o -name '.tmp-*' \) -print0 2>/dev/null)
+    while IFS= read -r -d '' f; do
+      echo "removing stale lock: $f"; rm -f -- "$f"; removed=$((removed + 1))
+    done < <(find "$repo/refs" -type f -name '*.lock' -print0 2>/dev/null; \
+             for l in packed-refs.lock HEAD.lock config.lock shallow.lock; do [ -f "$repo/$l" ] && printf '%s\0' "$repo/$l"; done; true)
+  fi
+done
+[ "$removed" -gt 0 ] && sync -f "$BASE"
+echo "cleanup ($MODE): $removed item(s) removed"

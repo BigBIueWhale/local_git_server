@@ -1,0 +1,23 @@
+#!/bin/bash
+# as-root COMMAND [ARGS...]: runs a command as root on this machine, in the current directory.
+#   - already root: runs it directly;
+#   - sudo works without a password: through sudo;
+#   - otherwise, if this user can use Docker: through a privileged container that enters the host's
+#     namespaces (nsenter -t 1), so the command runs exactly as it would under sudo, with the host's
+#     own programs. Being in the docker group is root-equivalent; this only makes that explicit.
+set -euo pipefail
+[ $# -ge 1 ] || { echo "usage: $0 COMMAND [ARGS...]" >&2; exit 2; }
+
+# The same pinned Alpine as the server image (its busybox provides nsenter).
+NSENTER_IMAGE=alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+
+if [ "$(id -u)" = 0 ]; then exec "$@"; fi
+if sudo -n true 2>/dev/null; then exec sudo -- "$@"; fi
+if docker info >/dev/null 2>&1; then
+  tty=(); [ -t 0 ] && [ -t 1 ] && tty=(-t)
+  exec docker run --rm -i "${tty[@]}" --privileged --pid=host --net=host --ipc=host --uts=host \
+    "$NSENTER_IMAGE" nsenter -t 1 -m -u -i -n -p -- \
+    /bin/sh -c 'cd "$1" || exit 1; shift; exec "$@"' sh "$PWD" "$@"
+fi
+echo "error: need root: run as root or with sudo, or as a member of the docker group" >&2
+exit 1

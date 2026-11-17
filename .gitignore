@@ -1,0 +1,2 @@
+# This machine's settings (the stick's serial and UUID) stay local.
+config.env

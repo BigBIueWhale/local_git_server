@@ -1,0 +1,8 @@
+# @STICK_NAME@, serial @STICK_SERIAL@: storage of the local git server.
+# See /opt/gitstick/README.md.
+
+# Hide it from udisks/GNOME: the desktop never mounts it elsewhere or offers to eject it.
+SUBSYSTEM=="block", ENV{ID_SERIAL_SHORT}=="@STICK_SERIAL@", ENV{UDISKS_IGNORE}="1", ENV{UDISKS_AUTO}="0"
+
+# Never let USB power saving suspend it.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{serial}=="@STICK_SERIAL@", TEST=="power/control", ATTR{power/control}="on"

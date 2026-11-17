@@ -1,0 +1,22 @@
+# /etc/gitconfig inside the local git server image.
+[core]
+	# fsync every object, pack and ref update: when a push reports success, it is on the stick.
+	fsync = all
+	fsyncMethod = fsync
+	# Server-side hooks never run (the stick is also mounted noexec).
+	hooksPath = /dev/null
+	# Keep reflogs in the bare repositories, so every ref update can be traced and undone.
+	logAllRefUpdates = true
+[receive]
+	# Check every pushed object before accepting it.
+	fsckObjects = true
+	# No history rewrites and no branch deletions through a push.
+	denyNonFastForwards = true
+	denyDeletes = true
+[transfer]
+	fsckObjects = true
+[gc]
+	# Reflog entries are kept forever. Pruning stays at git's default (2 weeks): with force-push
+	# and branch deletion refused, the only thing it can remove is debris from failed pushes.
+	reflogExpire = never
+	reflogExpireUnreachable = never

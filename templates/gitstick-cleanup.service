@@ -1,0 +1,17 @@
+[Unit]
+Description=Remove leftovers of interrupted pushes from the local git server's repositories
+Documentation=file:/opt/gitstick/README.md
+After=srv-gitstick.mount
+ConditionPathIsMountPoint=/srv/gitstick
+
+[Service]
+Type=oneshot
+User=1000
+Group=1000
+ExecStart=/opt/gitstick/gitstick-cleanup stale
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=-/srv/gitstick/git

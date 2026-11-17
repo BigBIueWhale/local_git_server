@@ -1,0 +1,23 @@
+#!/bin/bash
+# add-repo NAME
+#
+# Creates an empty bare repository NAME.git on the stick, with master as its branch, and prints
+# how to point a working copy at it. Needs Docker, not root.
+source "$(dirname "$0")/lib/common.sh"
+
+[ $# = 1 ] || die "usage: $0 NAME"
+NAME=${1%.git}
+[[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "NAME may hold letters, digits and ._- (starting with a letter or digit)"
+[[ "$NAME" != _selftest* ]] || die "names starting with _selftest are reserved for ./run-tests"
+load_config full
+stick_mounted_rw || die "the stick isn't mounted read-write at $MOUNT_POINT"
+[ -d "$REPOS_DIR" ] || die "$REPOS_DIR missing: run ./as-root ./install"
+[ ! -e "$REPOS_DIR/$NAME.git" ] || die "$NAME.git already exists"
+
+image_git rw init --bare --initial-branch=master --template= "/srv/git/$NAME.git"
+sync -f "$REPOS_DIR"
+cat <<EOF
+Created $REPOS_DIR/$NAME.git. In the working copy:
+    git remote add origin git://${LISTEN%:9418}/$NAME.git
+    git push -u origin master
+EOF

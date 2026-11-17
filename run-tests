@@ -1,0 +1,136 @@
+#!/bin/bash
+# run-tests [--no-replug]
+#
+# Tests the installation on this machine, end to end. Takes the server down for a few seconds
+# (several times). Leaves nothing behind: a throwaway repository _selftest.git is created on the
+# stick and removed, and if a test fails half-way the stick is re-authorized and remounted anyway.
+#
+#   1  the server listens on 127.0.0.1:9418 only; this machine's network address is refused
+#   2  paths outside the repositories are refused
+#   3  a push whose client is killed mid-transfer: no ref changes, and the next server start
+#      removes the quarantine folder it leaves
+#   4  stopping the mount stops the server; the empty mount point refuses writes; starting the
+#      mount brings the server back by itself
+#   5  (unless --no-replug) unplugging the stick in software (USB "authorized" = 0) stops
+#      everything; plugging it back fscks, mounts and starts the server by itself
+#   6  every repository on the stick reads back clean (git fsck --full --strict), after 4/5
+#      dropped the stick's data from memory
+#
+# Run as root: ./as-root ./run-tests
+source "$(dirname "$0")/lib/common.sh"
+set +e   # failures are counted, not fatal; cleanup always runs
+
+REPLUG=1
+for a in "$@"; do
+  case "$a" in --no-replug) REPLUG=0 ;; *) die "unknown option: $a" ;; esac
+done
+need_root "$@"
+load_config full
+
+URL=git://${LISTEN%:9418}
+SELF=_selftest
+TMP=$(mktemp -d)
+USB_DIR=$(stick_usb_dir || true)
+PASS=() FAIL=()
+
+cleanup() {
+  [ -n "$USB_DIR" ] && [ -f "$USB_DIR/authorized" ] && [ "$(cat "$USB_DIR/authorized")" = 0 ] && echo 1 > "$USB_DIR/authorized"
+  for _ in $(seq 1 60); do [ -e "/dev/disk/by-uuid/$STICK_FS_UUID" ] && break; sleep 1; done
+  systemctl start "$MOUNT_UNIT" 2>/dev/null
+  systemctl start "$SERVICE_UNIT" 2>/dev/null
+  if stick_mounted_rw && [ -d "$REPOS_DIR/$SELF.git" ]; then as_server_user rm -rf --one-file-system -- "$REPOS_DIR/$SELF.git"; fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+ok()   { PASS+=("$1"); echo "  PASS: $1"; }
+bad()  { FAIL+=("$1"); echo "  FAIL: $1"; }
+up()   { systemctl is-active --quiet "$SERVICE_UNIT" && ss -tlnH "sport = :9418" | grep -q .; }
+down() { ! systemctl is-active --quiet "$SERVICE_UNIT" && ! ss -tlnH "sport = :9418" | grep -q . && ! mountpoint -q "$MOUNT_POINT"; }
+wait_for() { local t=$1; shift; for _ in $(seq 1 "$t"); do "$@" && return 0; sleep 1; done; return 1; }
+reachable() { timeout 15 git ls-remote "$URL/$1" >/dev/null 2>&1; }
+quarantines() { ls -d "$REPOS_DIR/$SELF.git"/objects/tmp_objdir-incoming-* 2>/dev/null | wc -l; }
+
+log "0 preflight"
+up || die "the server isn't running: ./as-root ./install first"
+stick_mounted_rw || die "the stick isn't mounted"
+[ -d "$REPOS_DIR/$SELF.git" ] && die "$REPOS_DIR/$SELF.git exists from an earlier run: remove it first"
+
+log "1 loopback only"
+listeners=$(ss -tlnH "sport = :9418" | awk '{print $4}' | sort -u | tr '\n' ' ')
+[ "$listeners" = "$LISTEN " ] && ok "only listener on port 9418 is $LISTEN" || bad "listeners on 9418: [$listeners]"
+rl=$(sysctl -a 2>/dev/null | awk -F' = ' '/^net\.ipv4\.conf\..*\.route_localnet/ && $2 != 0 {print $1}' | tr '\n' ' ')
+[ -z "$rl" ] && ok "route_localnet is 0 on every interface (127.0.0.1 unroutable from outside)" || bad "route_localnet enabled on: $rl"
+addr=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
+if [ -z "$addr" ]; then echo "  (no global IPv4 address to try)"
+elif timeout 10 git ls-remote "git://$addr/x.git" >/dev/null 2>&1; then bad "reachable on $addr"
+else ok "refused on this machine's address $addr"; fi
+
+log "2 paths"
+for p in '/../../etc' '~root' '/srv/git/../../etc'; do
+  reachable "$p" && bad "served $p" || ok "refused $p"
+done
+
+log "3 interrupted push"
+image_git rw init -q --bare --initial-branch=master --template= "/srv/git/$SELF.git"
+git init -q -b master "$TMP/src"
+head -c 800M /dev/urandom > "$TMP/src/blob"
+git -C "$TMP/src" add blob
+GIT_AUTHOR_NAME=selftest GIT_AUTHOR_EMAIL=selftest@localhost GIT_COMMITTER_NAME=selftest GIT_COMMITTER_EMAIL=selftest@localhost \
+  git -C "$TMP/src" commit -qm selftest
+( cd "$TMP/src" && exec setsid git push -q "$URL/$SELF.git" master > "$TMP/push.out" 2>&1 ) &
+pg=$!
+sleep 4
+during=$(quarantines)
+kill -KILL -- "-$pg" 2>/dev/null; wait "$pg" 2>/dev/null
+sleep 6
+refs=$(as_server_user git -C "$REPOS_DIR/$SELF.git" for-each-ref | wc -l)
+if [ "$during" = 0 ]; then bad "no push in progress after 4 s (too fast or failed: $(cat "$TMP/push.out"))"
+elif [ "$refs" != 0 ]; then bad "the push completed before it was killed"
+else
+  ok "killed mid-push: no ref changed"
+  echo "  quarantine folders left by git after the kill: $(quarantines)"
+  systemctl restart "$SERVICE_UNIT"; wait_for 30 up
+  [ "$(quarantines)" = 0 ] && ok "server start removed the leftover" || bad "leftover still there after a server start"
+fi
+as_server_user rm -rf --one-file-system -- "$REPOS_DIR/$SELF.git"
+
+log "4 stop and start the mount"
+systemctl stop "$MOUNT_UNIT"
+wait_for 15 down && ok "server and mount down" || bad "not down: server=$(systemctl is-active "$SERVICE_UNIT") mount=$(systemctl is-active "$MOUNT_UNIT")"
+if touch "$MOUNT_POINT/.write-test" 2>/dev/null; then rm -f "$MOUNT_POINT/.write-test"; bad "wrote into the empty mount point"; else ok "empty mount point refuses writes (even root)"; fi
+reachable x.git && bad "server answered with the stick unmounted" || ok "connection refused while unmounted"
+systemctl start "$MOUNT_UNIT"
+wait_for 60 up && ok "server came back with the mount" || bad "server didn't come back"
+
+if [ "$REPLUG" = 1 ]; then
+  log "5 software unplug and replug"
+  if [ -z "$USB_DIR" ]; then bad "no USB device with serial $STICK_SERIAL"
+  else
+    sync
+    echo 0 > "$USB_DIR/authorized"
+    wait_for 20 down && ok "unplugged: server and mount down" || bad "after unplug: server=$(systemctl is-active "$SERVICE_UNIT") mount=$(systemctl is-active "$MOUNT_UNIT")"
+    reachable x.git && bad "server answered while unplugged" || ok "connection refused while unplugged"
+    echo 1 > "$USB_DIR/authorized"
+    if wait_for 90 up; then
+      ok "replugged: fsck, mount and server came back by themselves"
+      part=$(findmnt -rn -o SOURCE --mountpoint "$MOUNT_POINT")
+      udevadm info -q property -n "$part" | grep -q '^UDISKS_IGNORE=1$' && ok "still hidden from udisks" || bad "udisks not ignoring $part"
+      [ "$(cat "$USB_DIR/power/control")" = on ] && ok "USB power saving off" || bad "USB power/control=$(cat "$USB_DIR/power/control")"
+    else bad "server didn't come back after replug"; fi
+  fi
+fi
+
+log "6 read back every repository"
+for r in "$REPOS_DIR"/*.git; do
+  [ -d "$r" ] || continue
+  n=$(basename "$r")
+  if image_git ro -C "/srv/git/$n" fsck --full --strict --no-dangling --no-progress >"$TMP/fsck.out" 2>&1; then
+    ok "$n reads back clean ($(as_server_user git -C "$r" rev-list --all --count) commits)"
+  else bad "$n: $(head -3 "$TMP/fsck.out" | tr '\n' ' ')"; fi
+done
+
+echo
+echo "passed: ${#PASS[@]}, failed: ${#FAIL[@]}"
+for f in "${FAIL[@]}"; do echo "  FAILED: $f"; done
+[ ${#FAIL[@]} = 0 ]

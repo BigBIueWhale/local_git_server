@@ -1,0 +1,27 @@
+[Unit]
+Description=@STICK_NAME@ @STICK_SERIAL@: storage of the local git server
+Documentation=file:/opt/gitstick/README.md
+# fsck before every mount. If fsck fails, the stick isn't mounted and the git server doesn't start.
+Requires=systemd-fsck@dev-disk-by\x2duuid-@STICK_FS_UUID_ESC@.service
+After=systemd-fsck@dev-disk-by\x2duuid-@STICK_FS_UUID_ESC@.service
+After=blockdev@dev-disk-by\x2duuid-@STICK_FS_UUID_ESC@.target
+# If the stick disappears (pulled out, USB reset), unmount at once, which also stops the git server.
+# When it comes back, the device's .wants link mounts it again, after a fresh fsck.
+BindsTo=dev-disk-by\x2duuid-@STICK_FS_UUID_ESC@.device
+After=dev-disk-by\x2duuid-@STICK_FS_UUID_ESC@.device
+
+[Mount]
+# By file-system UUID: only this stick's ext4 can ever be mounted here.
+What=/dev/disk/by-uuid/@STICK_FS_UUID@
+Where=/srv/gitstick
+Type=ext4
+# errors=remount-ro: on a file-system error, stop writing instead of carrying on.
+# nofail: a missing stick never holds up boot.
+Options=rw,noatime,nodev,nosuid,noexec,errors=remount-ro,nofail
+TimeoutSec=120
+# A stick that's gone can always be let go of, so a re-plug is never blocked by a stale mount.
+LazyUnmount=yes
+
+[Install]
+# Mounted whenever the stick appears: at boot, or when it's plugged in later.
+WantedBy=dev-disk-by\x2duuid-@STICK_FS_UUID_ESC@.device

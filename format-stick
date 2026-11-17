@@ -1,0 +1,82 @@
+#!/bin/bash
+# format-stick [--confirm=SERIAL]
+#
+# ERASES the USB stick whose serial is STICK_SERIAL in config.env: wipes its signatures, writes a
+# new GPT with one partition filling the stick, formats it ext4 (root folder owned by uid 1000,
+# all inode tables written now), checks the result, and writes the new file-system UUID into
+# config.env as STICK_FS_UUID. Then run ./as-root ./install.
+#
+# It refuses unless the stick is a removable USB disk of plausible size with nothing mounted,
+# and you confirm by typing its serial (or pass --confirm=SERIAL).
+#
+# Run as root: ./as-root ./format-stick
+source "$(dirname "$0")/lib/common.sh"
+
+CONFIRM=''
+for a in "$@"; do
+  case "$a" in
+    --confirm=*) CONFIRM=${a#--confirm=} ;;
+    *) die "unknown option: $a" ;;
+  esac
+done
+need_root "$@"
+load_config serial
+for c in lsblk wipefs sgdisk partprobe udevadm mkfs.ext4 e2fsck blkid findmnt; do
+  command -v "$c" >/dev/null || die "missing command: $c"
+done
+
+DEV=$(stick_disk) || die "no USB disk with serial $STICK_SERIAL is plugged in (lsblk -do NAME,SERIAL,TRAN,SIZE lists them)"
+log "target: $DEV"
+lsblk -o NAME,SIZE,TYPE,TRAN,RM,VENDOR,MODEL,SERIAL,FSTYPE,LABEL,MOUNTPOINTS "$DEV"
+
+[ "$(lsblk -dno TRAN "$DEV" | tr -d ' ')" = usb ] || die "$DEV isn't a USB disk"
+[ "$(lsblk -dno RM "$DEV" | tr -d ' ')" = 1 ] || die "$DEV isn't removable"
+SIZE=$(lsblk -dbno SIZE "$DEV")
+[ "$SIZE" -ge 1000000000 ] && [ "$SIZE" -le 2000000000000 ] || die "unexpected size: $SIZE bytes"
+if systemctl is-active --quiet "$MOUNT_UNIT" && [ "$(findmnt -rn -o SOURCE --mountpoint "$MOUNT_POINT" | sed 's/[0-9]*$//')" = "$DEV" ]; then
+  die "this is the git server's stick and it's in use: stop it first (systemctl stop $SERVICE_UNIT $MOUNT_UNIT)"
+fi
+for part in $(lsblk -nrpo NAME "$DEV"); do
+  if findmnt -rn -S "$part" >/dev/null; then die "$part is mounted ($(findmnt -rn -o TARGET -S "$part" | tr '\n' ' ')): unmount it first"; fi
+done
+
+if [ -z "$CONFIRM" ]; then
+  [ -r /dev/tty ] || die "no terminal to confirm on: pass --confirm=$STICK_SERIAL"
+  printf 'EVERYTHING on %s (serial %s, %s bytes) will be erased.\nType the serial to continue: ' "$DEV" "$STICK_SERIAL" "$SIZE" > /dev/tty
+  read -r CONFIRM < /dev/tty
+fi
+[ "$CONFIRM" = "$STICK_SERIAL" ] || die "confirmation doesn't match the serial: nothing done"
+
+log "wipe"
+for part in $(lsblk -nrpo NAME,TYPE "$DEV" | awk '$2 == "part" {print $1}'); do wipefs -a "$part"; done
+wipefs -a "$DEV"
+sgdisk --zap-all "$DEV"
+
+log "GPT with one partition filling the stick"
+sgdisk -n 1:0:0 -t 1:8300 "$DEV"
+partprobe "$DEV"
+udevadm settle
+PART=$(lsblk -nrpo NAME,TYPE "$DEV" | awk '$2 == "part" {print $1}')
+[ "$(printf '%s\n' "$PART" | wc -l)" = 1 ] && [ -b "$PART" ] || die "expected exactly one new partition, found: $PART"
+
+log "ext4 on $PART"
+mkfs.ext4 -E "root_owner=$SERVER_UID:$SERVER_GID,lazy_itable_init=0,lazy_journal_init=0" "$PART" < /dev/null
+sync
+
+log "verify"
+sgdisk -v "$DEV"
+e2fsck -fn "$PART"
+udevadm settle
+NEW_UUID=$(blkid -s UUID -o value "$PART")
+[[ "$NEW_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "couldn't read the new UUID"
+
+log "config.env: STICK_FS_UUID=$NEW_UUID"
+owner=$(stat -c '%u:%g' "$CONFIG_FILE")
+tmp=$(mktemp "$CONFIG_FILE.XXXXXX")
+if grep -q '^STICK_FS_UUID=' "$CONFIG_FILE"; then
+  sed "s/^STICK_FS_UUID=.*/STICK_FS_UUID=$NEW_UUID/" "$CONFIG_FILE" > "$tmp"
+else
+  { cat "$CONFIG_FILE"; echo "STICK_FS_UUID=$NEW_UUID"; } > "$tmp"
+fi
+chown "$owner" "$tmp"; chmod --reference="$CONFIG_FILE" "$tmp"; mv "$tmp" "$CONFIG_FILE"
+echo "done. Next: ./as-root ./install"

@@ -1,0 +1,38 @@
+[Unit]
+Description=Local git server (git daemon in Docker) on 127.0.0.1:9418, repositories on the @STICK_NAME@
+Documentation=file:/opt/gitstick/README.md
+# Runs only while the stick is mounted, and stops at once if the stick goes away,
+# so nothing can ever be written to the computer's own disk in its place.
+BindsTo=srv-gitstick.mount
+After=srv-gitstick.mount
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=exec
+# Refuse to start unless the stick's own ext4 (by UUID) is what's mounted there, read-write.
+ExecStartPre=/usr/bin/findmnt --mountpoint /srv/gitstick --source UUID=@STICK_FS_UUID@ --types ext4 --options rw
+ExecStartPre=/usr/bin/test -d /srv/gitstick/git
+# Before any connection is accepted, clear what interrupted pushes left behind (as uid 1000, not root).
+ExecStartPre=/usr/bin/setpriv --reuid=1000 --regid=1000 --clear-groups /opt/gitstick/gitstick-cleanup start
+ExecStartPre=-/usr/bin/docker rm -f gitstick
+# --network=host with git daemon --listen=127.0.0.1: a plain loopback socket, no NAT or docker-proxy.
+# The bind mount must already exist (--mount fails instead of creating it).
+ExecStart=/usr/bin/docker run --rm --name gitstick --pull=never --init \
+  --network=host \
+  --user=1000:1000 \
+  --read-only --tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --pids-limit=256 --memory=8g \
+  --log-driver=none \
+  --mount=type=bind,source=/srv/gitstick/git,target=/srv/git \
+  local/gitstick:2
+ExecStop=/usr/bin/docker stop --timeout=60 gitstick
+# 143 = git daemon ending on SIGTERM from `docker stop`: a normal stop, not a failure.
+SuccessExitStatus=143
+Restart=always
+RestartSec=5
+TimeoutStopSec=90
+
+[Install]
+WantedBy=srv-gitstick.mount
